@@ -4,18 +4,16 @@ const axios = require('axios');
 const bodyParser = require('body-parser');
 const app = express();
 
-// ★重要：Renderなどの環境変数を使う（セキュア）
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || '★ここにチャネルシークレット★';
-const GAS_ENDPOINT = process.env.GAS_ENDPOINT || '★ここにGASエンドポイント★';
+// ✅ Renderの環境変数に合わせて修正
+const LINE_CHANNEL_SECRET = process.env.CHANNEL_SECRET;
+const GAS_ENDPOINT = process.env.GAS_URL;
 
-// rawBody取得の設定（署名検証用）
 app.use(bodyParser.json({
   verify: (req, res, buf) => {
-    req.rawBody = buf.toString(); // ←ここ重要
+    req.rawBody = buf.toString();
   }
 }));
 
-// 署名検証関数
 function validateSignature(signature, body) {
   const hash = crypto
     .createHmac('SHA256', LINE_CHANNEL_SECRET)
@@ -24,21 +22,18 @@ function validateSignature(signature, body) {
   return signature === hash;
 }
 
-// Webhookエンドポイント
 app.post('/webhook', async (req, res) => {
   const signature = req.headers['x-line-signature'];
 
-  // 署名不一致 → 拒否
   if (!validateSignature(signature, req.rawBody)) {
-    console.error('署名検証失敗');
+    console.error('❌ 署名検証に失敗しました');
     return res.status(401).send('Unauthorized');
   }
 
   const events = req.body.events;
 
-  // イベントがない場合
   if (!events || events.length === 0) {
-    console.log('イベントが空です');
+    console.log('⚠️ イベントが空です');
     return res.status(200).send('No events');
   }
 
@@ -55,15 +50,14 @@ app.post('/webhook', async (req, res) => {
     };
 
     const response = await axios.post(GAS_ENDPOINT, testData);
-    console.log('GAS応答:', response.status);
+    console.log('✅ GAS送信成功:', response.status);
     return res.status(200).send('OK');
   } catch (error) {
-    console.error('GAS送信エラー:', error.message);
+    console.error('❌ GAS送信エラー:', error.message);
     return res.status(500).send('Internal Server Error');
   }
 });
 
-// サーバー起動
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
