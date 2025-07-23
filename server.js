@@ -1,129 +1,89 @@
 const express = require('express');
-const line = require('@line/bot-sdk');
+const bodyParser = require('body-parser');
 const axios = require('axios');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-const config = {
-  channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.CHANNEL_SECRET,
-};
-const client = new line.Client(config);
+// 🔒 LINEチャネル設定
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
-const userStates = {};
+// 📊 Google Apps ScriptのWebhook URL（GAS側doPost）
+const GAS_WEBHOOK_URL = 'https://script.google.com/macros/s/あなたのGASデプロイURL/exec';
 
-app.post('/webhook', line.middleware(config), async (req, res) => {
-  Promise.all(req.body.events.map(handleEvent))
-    .then(() => res.status(200).end())
-    .catch(err => {
-      console.error(err);
-      res.status(500).end();
+// 🔧 rawBodyを取得する設定（署名検証用）
+app.use(bodyParser.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
+
+// 🔐 LINE署名検証
+function validateSignature(rawBody, signature) {
+  const hash = crypto.createHmac('SHA256', LINE_CHANNEL_SECRET)
+    .update(rawBody)
+    .digest('base64');
+  return hash === signature;
+}
+
+// 📩 受信Webhook処理
+app.post('/webhook', async (req, res) => {
+  const signature = req.headers['x-line-signature'];
+  const rawBody = req.rawBody;
+
+  if (!validateSignature(rawBody, signature)) {
+    console.log('❌ Signature validation failed');
+    return res.status(401).send('Unauthorized');
+  }
+
+  const events = req.body.events;
+  if (!events || events.length === 0) {
+    return res.status(200).send('No events');
+  }
+
+  const event = events[0];
+
+  // ここでテキスト送信に対応（任意）
+  if (event.type === 'message' && event.message.type === 'text') {
+    const replyMessage = {
+      replyToken: event.replyToken,
+      messages: [{ type: 'text', text: 'メッセージを受け取りました！' }]
+    };
+
+    try {
+      await axios.post('https://api.line.me/v2/bot/message/reply', replyMessage, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
+        }
+      });
+    } catch (err) {
+      console.error('LINEメッセージ送信失敗:', err.response?.data || err.message);
+    }
+  }
+
+  // 🔁 GASへ送信（例：アンケート終了後など）
+  try {
+    await axios.post(GAS_WEBHOOK_URL, {
+      userId: event.source.userId,
+      name: '仮の名前',
+      jobType: 'ホールスタッフ',
+      area: '新宿',
+      days: '週3日以上',
+      experience: 'あり',
+      pr: 'よろしくお願いします'
     });
+  } catch (err) {
+    console.error('GAS送信エラー:', err.response?.data || err.message);
+  }
+
+  res.status(200).send('OK');
 });
 
-async function handleEvent(event) {
-  if (event.type !== 'message' || !event.message) return;
-
-  const userId = event.source.userId;
-  const text = event.message.text;
-
-  if (!userStates[userId]) {
-    userStates[userId] = { step: 1, answers: { userId } };
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: 'アンケートを始めます！\nあなたの本名を教えてください（漢字）',
-    });
-  }
-
-  const s = userStates[userId];
-
-  switch (s.step) {
-    case 1:
-      s.answers.realName = text;
-      s.step++;
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: '面接希望日を入力してください（日祝を除く19〜21時対応）',
-      });
-
-    case 2:
-      s.answers.interviewDate = text;
-      s.step++;
-      return quick(event, 'キャバクラ経験はありますか？', ['あり', 'なし']);
-
-    case 3:
-      s.answers.hasExperience = text;
-      if (text === 'あり') {
-        s.step++;
-        return client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: '過去に在籍していた店舗名を教えてください',
-        });
-      } else {
-        s.answers.pastShops = '';
-        s.step = 5;
-        return quick(event, 'タトゥー・傷はありますか？', ['あり', 'なし']);
-      }
-
-    case 4:
-      s.answers.pastShops = text;
-      s.step++;
-      return quick(event, 'タトゥー・傷はありますか？', ['あり', 'なし']);
-
-    case 5:
-      s.answers.hasTattooOrScar = text;
-      s.step++;
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: '顔がわかる写真を2〜3枚アップロードしてください（画像を送ってください）',
-      });
-
-    case 6:
-      // 写真受信処理（画像でない場合は再入力促す）
-      if (event.message.type !== 'image') {
-        return client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: '写真を画像形式で送信してください📷',
-        });
-      }
-
-      // LINE画像URL取得（有効期限あり）
-      const messageId = event.message.id;
-      const imageUrl = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
-      s.answers.photos = imageUrl;
-
-      // スプレッドシートへ送信
-      await axios.post(process.env.GAS_URL, s.answers);
-      delete userStates[userId];
-
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: 'ご応募ありがとうございました！担当者よりご連絡いたします📩',
-      });
-
-    default:
-      return;
-  }
-}
-
-function quick(event, question, choices) {
-  return client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: question,
-    quickReply: {
-      items: choices.map(label => ({
-        type: 'action',
-        action: {
-          type: 'message',
-          label,
-          text: label,
-        },
-      })),
-    },
-  });
-}
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Listening on ${port}`));
+// 🚀 起動
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+});
