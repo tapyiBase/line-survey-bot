@@ -1,79 +1,66 @@
 const express = require('express');
+const bodyParser = require('body-parser');
+const crypto = require('crypto');
 const line = require('@line/bot-sdk');
-const axios = require('axios');
-const FormData = require('form-data');
-const { Buffer } = require('buffer');
 
 const app = express();
-app.use(express.json());
 
-// LINE設定
+// LINEの設定
 const config = {
-  channelAccessToken: 'vTdm94c2EPcZs3p7ktHfVvch8HHZ64/rD5SWKmm7jEfl+S0Lw12WvRUSTN1h3q6ymJUGlfMBmUEi8u+5IebXDe9UTQXvfM8ABDfEIShRSvghvsNEQD0Ms+vX3tOy9zo3EpJL8oE0ltSGHIZFskwNagdB04t89/1O/w1cDnyilFU=',
-  channelSecret: '1564c7045280f8e5de962041ffb6568b'
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+  channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 
+// LINE SDK クライアント
 const client = new line.Client(config);
 
-// Webhook受信
-app.post('/webhook', line.middleware(config), async (req, res) => {
-  const events = req.body.events;
-
-  try {
-    const results = await Promise.all(events.map(handleEvent));
-    res.json(results);
-  } catch (error) {
-    console.error('エラーハンドリング中に問題が発生:', error);
-    res.status(500).end();
+// 🔻 rawBody 保存用のミドルウェア設定
+app.use(bodyParser.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf; // Buffer型を保存
   }
+}));
+
+// Webhookエンドポイント
+app.post('/webhook', (req, res) => {
+  // 🔻 署名を検証
+  const signature = req.headers['x-line-signature'];
+  const isValid = validateSignature(req.rawBody, config.channelSecret, signature);
+
+  if (!isValid) {
+    console.log('⚠️ Invalid signature');
+    return res.status(403).send('Invalid signature');
+  }
+
+  // 🔻 LINEイベント処理
+  Promise.all(req.body.events.map(handleEvent))
+    .then(() => res.status(200).end())
+    .catch((err) => {
+      console.error(err);
+      res.status(500).end();
+    });
 });
 
-// イベント処理関数
-async function handleEvent(event) {
-  if (event.type !== 'message') return Promise.resolve(null);
+// 署名検証関数
+function validateSignature(body, secret, signature) {
+  const hmac = crypto.createHmac('SHA256', secret);
+  hmac.update(body);
+  const expectedSignature = hmac.digest('base64');
+  return signature === expectedSignature;
+}
 
-  const userId = event.source.userId;
-  const timestamp = new Date(event.timestamp).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
-
-  if (event.message.type === 'image') {
-    const messageId = event.message.id;
-    const imageBuffer = await client.getMessageContent(messageId).then(streamToBuffer);
-    const base64Image = imageBuffer.toString('base64');
-
-    // GASにPOST送信
-    const formData = new FormData();
-    formData.append('userId', userId);
-    formData.append('timestamp', timestamp);
-    formData.append('imageData', base64Image);
-
-    const headers = formData.getHeaders();
-
-    await axios.post('https://script.google.com/macros/s/AKfycbxDN14UbuIVIXZNj-RWGIE5G6lUqnG6I9AEmsEDNKttEsAGmkCVrd0CscBMdRqiP7AK0Q/exec', formData, { headers });
-
+// イベント処理
+function handleEvent(event) {
+  if (event.type === 'message' && event.message.type === 'text') {
     return client.replyMessage(event.replyToken, {
       type: 'text',
-      text: '画像を受け取りました。担当者からの連絡をお待ちください。',
+      text: `受け取ったメッセージ: ${event.message.text}`
     });
   }
-
-  return client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: '画像を送ってください📷',
-  });
+  return Promise.resolve(null);
 }
 
-// ストリームをバッファに変換
-function streamToBuffer(stream) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on('data', chunk => chunks.push(chunk));
-    stream.on('end', () => resolve(Buffer.concat(chunks)));
-    stream.on('error', err => reject(err));
-  });
-}
-
-// サーバー起動
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`サーバー起動中: http://localhost:${PORT}`);
+  console.log(`🚀 LINE Bot running on port ${PORT}`);
 });
