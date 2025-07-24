@@ -2,146 +2,155 @@ const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
 const bodyParser = require('body-parser');
+const line = require('@line/bot-sdk');
 
 const app = express();
-const port = process.env.PORT || 10000;
 
-const CHANNEL_ACCESS_TOKEN = process.env.CHANNEL_ACCESS_TOKEN;
-const CHANNEL_SECRET = process.env.CHANNEL_SECRET;
-const GAS_URL = process.env.GAS_URL;
+const config = {
+  channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
+  channelSecret: process.env.CHANNEL_SECRET,
+};
+const GAS_ENDPOINT = process.env.GAS_URL;
+const client = new line.Client(config);
 
+// rawBody取得
 app.use(bodyParser.json({
   verify: (req, res, buf) => {
     req.rawBody = buf;
   }
 }));
 
-// ユーザーの回答ステート管理用
-const userStates = {};
-const questions = [
-  { key: 'name', text: '本名（氏名）を教えてください' },
-  { key: 'interview_date', text: '面接希望日を教えてください' },
-  { key: 'experience', text: '経験はありますか？', quickReply: ['あり', 'なし'] },
-  { key: 'past_shop', text: '過去に在籍していた店舗があれば教えてください' },
-  { key: 'tattoo', text: 'タトゥーや傷はありますか？', quickReply: ['あり', 'なし'] },
-  { key: 'photo_url', text: '顔写真をアップロードしてください（画像URLでもOKです）' }
-];
-
-// LINEからの署名を検証
-function validateSignature(req) {
-  const signature = req.headers['x-line-signature'];
-  const body = req.rawBody;
+// 署名検証
+function validateSignature(signature, body) {
   const hash = crypto
-    .createHmac('SHA256', CHANNEL_SECRET)
+    .createHmac('SHA256', config.channelSecret)
     .update(body)
     .digest('base64');
   return signature === hash;
 }
 
+// 質問リスト
+const questions = [
+  { key: 'name', text: 'お名前を教えてください。', type: 'text' },
+  { key: 'jobType', text: '希望職種を教えてください。', type: 'text' },
+  { key: 'area', text: '希望勤務地を教えてください。', type: 'text' },
+  { key: 'days', text: '出勤可能日数を教えてください（例：週3日）。', type: 'text' },
+  { key: 'experience', text: '経験年数を教えてください（例：未経験、1年など）。', type: 'text' },
+  { key: 'pr', text: '自己PRをお願いします。', type: 'text' },
+  { key: 'photo_url', text: '顔写真を1枚送ってください。', type: 'image' },
+];
+
+// 状態管理（メモリ上）
+const userContexts = {};
+
+// メインWebhook
 app.post('/webhook', async (req, res) => {
-  if (!validateSignature(req)) {
+  const signature = req.headers['x-line-signature'];
+  if (!validateSignature(signature, req.rawBody)) {
     return res.status(401).send('Unauthorized');
   }
 
   const events = req.body.events;
   for (const event of events) {
-    if (event.type === 'message' && event.message.type === 'text') {
-      const userId = event.source.userId;
-      const text = event.message.text.trim();
-
-      if (text === '登録') {
-        userStates[userId] = { answers: {}, current: 0 };
-        await replyText(event.replyToken, 'アンケートを開始します。');
-        await askNextQuestion(userId, event.replyToken);
-      } else if (userStates[userId]) {
-        const state = userStates[userId];
-        const question = questions[state.current];
-        state.answers[question.key] = text;
-        state.current++;
-
-        if (state.current < questions.length) {
-          await askNextQuestion(userId, event.replyToken);
-        } else {
-          await replyText(event.replyToken, 'アンケートの回答ありがとうございました！');
-          await sendToGAS(userId, state.answers);
-          delete userStates[userId];
-        }
-      } else {
-        await replyText(event.replyToken, '「登録」と送るとアンケートを始められます。');
-      }
+    if (event.type === 'message' || event.type === 'postback') {
+      await handleEvent(event);
     }
   }
 
-  res.sendStatus(200);
+  res.status(200).send('OK');
 });
 
-// 質問を送信する関数（QuickReply対応）
-async function askNextQuestion(userId, replyToken) {
-  const state = userStates[userId];
-  const question = questions[state.current];
+// イベント処理
+async function handleEvent(event) {
+  const userId = event.source.userId;
+  const msg = event.message;
+  const context = userContexts[userId] || { answers: {}, stepIndex: -1 };
 
-  const message = {
-    type: 'text',
-    text: question.text
-  };
+  // アンケート開始トリガー
+  if (msg.type === 'text' && msg.text === '登録') {
+    // すでに進行中か確認
+    if (context.stepIndex >= 0 && context.stepIndex < questions.length) {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: 'アンケートはすでに進行中です。前の質問に回答してください。',
+      });
+    }
 
-  if (question.quickReply) {
-    message.quickReply = {
-      items: question.quickReply.map(label => ({
-        type: 'action',
-        action: {
-          type: 'message',
-          label,
-          text: label
-        }
-      }))
-    };
-  }
+    context.stepIndex = 0;
+    userContexts[userId] = context;
 
-  await replyMessage(replyToken, [message]);
-}
-
-// LINEにメッセージを送信
-async function replyText(replyToken, text) {
-  await replyMessage(replyToken, [{ type: 'text', text }]);
-}
-
-async function replyMessage(replyToken, messages) {
-  try {
-    await axios.post('https://api.line.me/v2/bot/message/reply', {
-      replyToken,
-      messages
-    }, {
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${CHANNEL_ACCESS_TOKEN}`
-      }
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: 'アンケートを開始します。\n' + questions[0].text,
     });
-  } catch (error) {
-    console.error('LINEメッセージ送信エラー:', error.response?.data || error.message);
+  }
+
+  // 進行中のユーザー
+  if (context.stepIndex >= 0 && context.stepIndex < questions.length) {
+    const currentQuestion = questions[context.stepIndex];
+
+    if (currentQuestion.type === 'text' && msg.type === 'text') {
+      context.answers[currentQuestion.key] = msg.text;
+      context.stepIndex += 1;
+    } else if (currentQuestion.type === 'image' && msg.type === 'image') {
+      // 画像受信 → content取得 → base64変換
+      try {
+        const stream = await client.getMessageContent(msg.id);
+        const chunks = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        const buffer = Buffer.concat(chunks);
+        const base64Image = buffer.toString('base64');
+
+        context.answers[currentQuestion.key] = base64Image;
+        context.stepIndex += 1;
+      } catch (error) {
+        console.error('画像取得失敗:', error);
+        return client.replyMessage(event.replyToken, {
+          type: 'text',
+          text: '画像の受信に失敗しました。もう一度送ってください。',
+        });
+      }
+    } else {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: `「${currentQuestion.text}」への正しい形式での回答をお願いします。`,
+      });
+    }
+
+    // 次の質問へ
+    if (context.stepIndex < questions.length) {
+      userContexts[userId] = context;
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: questions[context.stepIndex].text,
+      });
+    }
+
+    // 最終送信（アンケート完了）
+    const finalData = {
+      userId,
+      ...context.answers,
+    };
+
+    try {
+      await axios.post(GAS_ENDPOINT, finalData);
+      await client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: 'ご登録ありがとうございました！内容を送信しました。',
+      });
+    } catch (error) {
+      console.error('GAS送信失敗:', error);
+      await client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: '送信時にエラーが発生しました。しばらくして再度お試しください。',
+      });
+    }
+
+    delete userContexts[userId];
   }
 }
 
-// GASにデータを送信
-async function sendToGAS(userId, answers) {
-  const payload = {
-    timestamp: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }),
-    userId,
-    ...answers
-  };
-
-  try {
-    await axios.post(GAS_URL, payload);
-    console.log('✅ GAS送信成功:', payload);
-  } catch (error) {
-    console.error('❌ GAS送信エラー:', error.response?.data || error.message);
-  }
-}
-
-app.get('/', (req, res) => {
-  res.send('LINEアンケートBot稼働中');
-});
-
-app.listen(port, () => {
-  console.log(`✅ Server running on port ${port}`);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
 });
