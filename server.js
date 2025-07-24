@@ -4,22 +4,16 @@ const axios = require('axios');
 const bodyParser = require('body-parser');
 const app = express();
 
-// Renderの環境変数から読み込み
+// .envの環境変数を使用
 const LINE_CHANNEL_SECRET = process.env.CHANNEL_SECRET;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.CHANNEL_ACCESS_TOKEN;
 const GAS_ENDPOINT = process.env.GAS_URL;
 
-app.use(bodyParser.json({
-  verify: (req, res, buf) => {
-    req.rawBody = buf;
-  }
-}));
-
-// 質問一覧（QuickReplyが必要なものは指定）
+// 質問一覧（QuickReplyの有無を含む）
 const questions = [
   { text: '本名（氏名）を教えてください。' },
   { text: '面接希望日を教えてください。（例：7月25日 15:00〜）' },
-  {
+  { 
     text: '経験はありますか？',
     quickReplies: ['あり', 'なし']
   },
@@ -33,6 +27,12 @@ const questions = [
 ];
 
 const userStates = {};
+
+app.use(bodyParser.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 
 function validateSignature(signature, body) {
   const hash = crypto
@@ -58,7 +58,7 @@ app.post('/webhook', async (req, res) => {
       const replyToken = event.replyToken;
       const userMessage = event.message.text.trim();
 
-      // 初回メッセージ
+      // 初期起動
       if (!userStates[userId]) {
         if (userMessage.includes('こんにちは') || userMessage.includes('スタート')) {
           userStates[userId] = { step: 0, answers: [] };
@@ -74,13 +74,13 @@ app.post('/webhook', async (req, res) => {
       if (state.step < questions.length - 1) {
         await sendQuestion(replyToken, state.step);
       } else {
-        // 最終メッセージ送信
+        // 最後のメッセージ
         await replyMessage(replyToken, { type: 'text', text: questions[questions.length - 1].text });
 
-        // GASへ送信
+        // GASに送信
         try {
           await axios.post(GAS_ENDPOINT, {
-            userId: userId,
+            userId,
             answers: state.answers
           });
           console.log(`[送信成功] userId: ${userId}`);
@@ -96,29 +96,28 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
 });
 
-async function sendQuestion(replyToken, step) {
-  const q = questions[step];
-  if (q.quickReplies) {
-    await replyMessage(replyToken, {
-      type: 'text',
-      text: q.text,
-      quickReply: {
-        items: q.quickReplies.map(choice => ({
-          type: 'action',
-          action: {
-            type: 'message',
-            label: choice,
-            text: choice
-          }
-        }))
-      }
-    });
-  } else {
-    await replyMessage(replyToken, {
-      type: 'text',
-      text: q.text
-    });
+async function sendQuestion(token, step) {
+  const question = questions[step];
+  const message = {
+    type: 'text',
+    text: question.text
+  };
+
+  // QuickReplyがある場合は付加
+  if (question.quickReplies) {
+    message.quickReply = {
+      items: question.quickReplies.map(label => ({
+        type: 'action',
+        action: {
+          type: 'message',
+          label,
+          text: label
+        }
+      }))
+    };
   }
+
+  await replyMessage(token, message);
 }
 
 async function replyMessage(token, message) {
@@ -133,7 +132,7 @@ async function replyMessage(token, message) {
       }
     });
   } catch (error) {
-    console.error('[送信エラー] LINE返信失敗:', error.response?.data || error.message);
+    console.error('[LINE返信失敗]:', error.response?.data || error.message);
   }
 }
 
