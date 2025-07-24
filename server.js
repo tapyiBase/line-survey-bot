@@ -1,108 +1,79 @@
 const express = require('express');
-const { middleware, Client } = require('@line/bot-sdk');
-const bodyParser = require('body-parser');
+const line = require('@line/bot-sdk');
 const axios = require('axios');
-
-const LINE_CHANNEL_SECRET = '1564c7045280f8e5de962041ffb6568b';
-const LINE_CHANNEL_ACCESS_TOKEN = 'vTdm94c2EPcZs3p7ktHfVvch8HHZ64/rD5SWKmm7jEfl+S0Lw12WvRUSTN1h3q6ymJUGlfMBmUEi8u+5IebXDe9UTQXvfM8ABDfEIShRSvghvsNEQD0Ms+vX3tOy9zo3EpJL8oE0ltSGHIZFskwNagdB04t89/1O/w1cDnyilFU=';
-const GAS_ENDPOINT = 'https://script.google.com/macros/s/AKfycbxDN14UbuIVIXZNj-RWGIE5G6lUqnG6I9AEmsEDNKttEsAGmkCVrd0CscBMdRqiP7AK0Q/exec';
-
-const config = {
-  channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN,
-  channelSecret: LINE_CHANNEL_SECRET,
-};
+const FormData = require('form-data');
+const { Buffer } = require('buffer');
 
 const app = express();
-const client = new Client(config);
+app.use(express.json());
 
-app.use(bodyParser.json());
-app.post('/webhook', middleware(config), async (req, res) => {
-  Promise.all(req.body.events.map(handleEvent))
-    .then(() => res.status(200).end())
-    .catch(err => {
-      console.error('Error in webhook handling:', err);
-      res.status(500).end();
-    });
+// LINE設定
+const config = {
+  channelAccessToken: 'vTdm94c2EPcZs3p7ktHfVvch8HHZ64/rD5SWKmm7jEfl+S0Lw12WvRUSTN1h3q6ymJUGlfMBmUEi8u+5IebXDe9UTQXvfM8ABDfEIShRSvghvsNEQD0Ms+vX3tOy9zo3EpJL8oE0ltSGHIZFskwNagdB04t89/1O/w1cDnyilFU=',
+  channelSecret: '1564c7045280f8e5de962041ffb6568b'
+};
+
+const client = new line.Client(config);
+
+// Webhook受信
+app.post('/webhook', line.middleware(config), async (req, res) => {
+  const events = req.body.events;
+
+  try {
+    const results = await Promise.all(events.map(handleEvent));
+    res.json(results);
+  } catch (error) {
+    console.error('エラーハンドリング中に問題が発生:', error);
+    res.status(500).end();
+  }
 });
 
-const userStates = {};
-
-const questions = [
-  '1. 本名（氏名）を教えてください。',
-  '2. 面接希望日を教えてください。（例：7月25日 15:00〜）',
-  '3. 経験はありますか？（あり / なし）',
-  '4. 過去に在籍していた店舗名があれば教えてください。',
-  '5. タトゥーや鯖（スジ彫り）はありますか？（あり / なし）',
-  '6. 顔写真または全身写真を送ってください。',
-];
-
+// イベント処理関数
 async function handleEvent(event) {
-  if (event.type !== 'message') return;
+  if (event.type !== 'message') return Promise.resolve(null);
 
   const userId = event.source.userId;
-  if (!userStates[userId]) {
-    userStates[userId] = { step: 0, answers: [] };
+  const timestamp = new Date(event.timestamp).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+
+  if (event.message.type === 'image') {
+    const messageId = event.message.id;
+    const imageBuffer = await client.getMessageContent(messageId).then(streamToBuffer);
+    const base64Image = imageBuffer.toString('base64');
+
+    // GASにPOST送信
+    const formData = new FormData();
+    formData.append('userId', userId);
+    formData.append('timestamp', timestamp);
+    formData.append('imageData', base64Image);
+
+    const headers = formData.getHeaders();
+
+    await axios.post('https://script.google.com/macros/s/AKfycbxDN14UbuIVIXZNj-RWGIE5G6lUqnG6I9AEmsEDNKttEsAGmkCVrd0CscBMdRqiP7AK0Q/exec', formData, { headers });
+
     return client.replyMessage(event.replyToken, {
       type: 'text',
-      text: questions[0],
+      text: '画像を受け取りました。担当者からの連絡をお待ちください。',
     });
   }
 
-  const state = userStates[userId];
+  return client.replyMessage(event.replyToken, {
+    type: 'text',
+    text: '画像を送ってください📷',
+  });
+}
 
-  // 画像を送った場合
-  if (state.step === 5 && event.message.type === 'image') {
-    const stream = await client.getMessageContent(event.message.id);
+// ストリームをバッファに変換
+function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
     const chunks = [];
-    for await (const chunk of stream) {
-      chunks.push(chunk);
-    }
-    const buffer = Buffer.concat(chunks);
-    const base64Image = buffer.toString('base64');
-
-    state.answers.push(`data:image/jpeg;base64,${base64Image}`);
-    await sendToGAS(userId, state.answers);
-
-    delete userStates[userId];
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: 'ご回答ありがとうございました！内容を確認して担当者よりご連絡いたします。',
-    });
-  }
-
-  // テキストでの回答
-  if (event.message.type === 'text') {
-    state.answers.push(event.message.text);
-    state.step++;
-
-    if (state.step < questions.length) {
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: questions[state.step],
-      });
-    }
-
-    await sendToGAS(userId, state.answers);
-    delete userStates[userId];
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: 'ご回答ありがとうございました！内容を確認して担当者よりご連絡いたします。',
-    });
-  }
+    stream.on('data', chunk => chunks.push(chunk));
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', err => reject(err));
+  });
 }
 
-async function sendToGAS(userId, answers) {
-  try {
-    await axios.post(GAS_ENDPOINT, {
-      userId,
-      answers,
-    });
-  } catch (error) {
-    console.error('Failed to send to GAS:', error);
-  }
-}
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+// サーバー起動
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`サーバー起動中: http://localhost:${PORT}`);
 });
