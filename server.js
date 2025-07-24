@@ -1,133 +1,108 @@
 const express = require('express');
-const crypto = require('crypto');
-const axios = require('axios');
+const { middleware, Client } = require('@line/bot-sdk');
 const bodyParser = require('body-parser');
-require('dotenv').config();
+const axios = require('axios');
+
+const LINE_CHANNEL_SECRET = '1564c7045280f8e5de962041ffb6568b';
+const LINE_CHANNEL_ACCESS_TOKEN = 'vTdm94c2EPcZs3p7ktHfVvch8HHZ64/rD5SWKmm7jEfl+S0Lw12WvRUSTN1h3q6ymJUGlfMBmUEi8u+5IebXDe9UTQXvfM8ABDfEIShRSvghvsNEQD0Ms+vX3tOy9zo3EpJL8oE0ltSGHIZFskwNagdB04t89/1O/w1cDnyilFU=';
+const GAS_ENDPOINT = 'https://script.google.com/macros/s/AKfycbxDN14UbuIVIXZNj-RWGIE5G6lUqnG6I9AEmsEDNKttEsAGmkCVrd0CscBMdRqiP7AK0Q/exec';
+
+const config = {
+  channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN,
+  channelSecret: LINE_CHANNEL_SECRET,
+};
 
 const app = express();
+const client = new Client(config);
 
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const GAS_ENDPOINT = process.env.GAS_ENDPOINT;
-
-const questions = [
-  '本名（氏名）を教えてください。',
-  '面接希望日を教えてください。（例：7月25日 15:00〜）',
-  '経験はありますか？（あり / なし）',
-  '過去に在籍していた店舗名があれば教えてください。',
-  'タトゥーや鯖（スジ彫り）はありますか？（あり / なし）',
-  '顔写真または全身写真を送ってください。',
-  'ご回答ありがとうございました！内容を確認して担当者よりご連絡いたします。'
-];
+app.use(bodyParser.json());
+app.post('/webhook', middleware(config), async (req, res) => {
+  Promise.all(req.body.events.map(handleEvent))
+    .then(() => res.status(200).end())
+    .catch(err => {
+      console.error('Error in webhook handling:', err);
+      res.status(500).end();
+    });
+});
 
 const userStates = {};
 
-app.use(bodyParser.json({
-  verify: (req, res, buf) => {
-    req.rawBody = buf;
-  }
-}));
+const questions = [
+  '1. 本名（氏名）を教えてください。',
+  '2. 面接希望日を教えてください。（例：7月25日 15:00〜）',
+  '3. 経験はありますか？（あり / なし）',
+  '4. 過去に在籍していた店舗名があれば教えてください。',
+  '5. タトゥーや鯖（スジ彫り）はありますか？（あり / なし）',
+  '6. 顔写真または全身写真を送ってください。',
+];
 
-function validateSignature(signature, body) {
-  const hash = crypto.createHmac('SHA256', LINE_CHANNEL_SECRET)
-    .update(body)
-    .digest('base64');
-  return signature === hash;
+async function handleEvent(event) {
+  if (event.type !== 'message') return;
+
+  const userId = event.source.userId;
+  if (!userStates[userId]) {
+    userStates[userId] = { step: 0, answers: [] };
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: questions[0],
+    });
+  }
+
+  const state = userStates[userId];
+
+  // 画像を送った場合
+  if (state.step === 5 && event.message.type === 'image') {
+    const stream = await client.getMessageContent(event.message.id);
+    const chunks = [];
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+    const buffer = Buffer.concat(chunks);
+    const base64Image = buffer.toString('base64');
+
+    state.answers.push(`data:image/jpeg;base64,${base64Image}`);
+    await sendToGAS(userId, state.answers);
+
+    delete userStates[userId];
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: 'ご回答ありがとうございました！内容を確認して担当者よりご連絡いたします。',
+    });
+  }
+
+  // テキストでの回答
+  if (event.message.type === 'text') {
+    state.answers.push(event.message.text);
+    state.step++;
+
+    if (state.step < questions.length) {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: questions[state.step],
+      });
+    }
+
+    await sendToGAS(userId, state.answers);
+    delete userStates[userId];
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: 'ご回答ありがとうございました！内容を確認して担当者よりご連絡いたします。',
+    });
+  }
 }
 
-app.post('/webhook', async (req, res) => {
-  const signature = req.headers['x-line-signature'];
-  const body = req.rawBody;
-
-  if (!validateSignature(signature, body)) {
-    console.log('[署名エラー] Invalid signature');
-    return res.status(401).send('Unauthorized');
-  }
-
-  const events = req.body.events;
-  for (const event of events) {
-    const userId = event.source.userId;
-    const replyToken = event.replyToken;
-
-    // 初期化：スタート
-    if (!userStates[userId]) {
-      const message = event.message?.text || '';
-      if (message.includes('こんにちは') || message.includes('スタート')) {
-        userStates[userId] = { step: 0, answers: [] };
-        await replyMessage(replyToken, { type: 'text', text: questions[0] });
-      }
-      continue;
-    }
-
-    const state = userStates[userId];
-
-    // 回答：テキスト or 画像
-    if (event.message.type === 'text') {
-      state.answers.push(event.message.text.trim());
-      state.step++;
-    } else if (event.message.type === 'image') {
-      // 画像処理
-      try {
-        const imageId = event.message.id;
-        const imageRes = await axios.get(`https://api-data.line.me/v2/bot/message/${imageId}/content`, {
-          responseType: 'arraybuffer',
-          headers: { 'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` }
-        });
-        const base64Image = Buffer.from(imageRes.data).toString('base64');
-        const dataUrl = `data:image/jpeg;base64,${base64Image}`;
-        state.answers.push(dataUrl);
-        state.step++;
-      } catch (err) {
-        console.error('[画像取得エラー]', err.message);
-        await replyMessage(replyToken, { type: 'text', text: '画像の取得に失敗しました。もう一度お試しください。' });
-        continue;
-      }
-    } else {
-      await replyMessage(replyToken, { type: 'text', text: 'テキストか画像を送ってください。' });
-      continue;
-    }
-
-    // 次の質問 or 完了処理
-    if (state.step < questions.length - 1) {
-      await replyMessage(replyToken, { type: 'text', text: questions[state.step] });
-    } else {
-      await replyMessage(replyToken, { type: 'text', text: questions[questions.length - 1] });
-
-      // GAS送信
-      try {
-        await axios.post(GAS_ENDPOINT, {
-          userId: userId,
-          answers: state.answers
-        });
-        console.log(`[送信成功] userId: ${userId}`);
-      } catch (error) {
-        console.error('[GAS送信エラー]:', error.message);
-      }
-
-      delete userStates[userId];
-    }
-  }
-
-  res.status(200).send('OK');
-});
-
-async function replyMessage(token, message) {
+async function sendToGAS(userId, answers) {
   try {
-    await axios.post('https://api.line.me/v2/bot/message/reply', {
-      replyToken: token,
-      messages: [message]
-    }, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
-      }
+    await axios.post(GAS_ENDPOINT, {
+      userId,
+      answers,
     });
   } catch (error) {
-    console.error('[LINE送信エラー]', error.message);
+    console.error('Failed to send to GAS:', error);
   }
 }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
