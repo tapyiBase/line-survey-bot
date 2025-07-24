@@ -1,118 +1,143 @@
 const express = require('express');
-const { Client, middleware } = require('@line/bot-sdk');
+const crypto = require('crypto');
 const axios = require('axios');
-
-const config = {
-  channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.CHANNEL_SECRET
-};
-
-const GAS_URL = process.env.GAS_URL;
-const client = new Client(config);
+const bodyParser = require('body-parser');
 const app = express();
-app.use(express.json());
-app.use(middleware(config));
 
-const questions = [
-  {
-    key: 'name',
-    text: 'お名前（本名）を教えてください。'
-  },
-  {
-    key: 'interview',
-    text: '面接希望日を教えてください（例：7月25日 or 未定）'
-  },
-  {
-    key: 'experience',
-    text: 'キャバクラ勤務の経験はありますか？',
-    quickReply: ['あり', 'なし']
-  },
-  {
-    key: 'pastShops',
-    text: '過去に在籍していた店舗があれば教えてください（なしでもOK）'
-  },
-  {
-    key: 'tattoo',
-    text: 'タトゥー・傷はありますか？',
-    quickReply: ['あり', 'なし']
+// Renderの環境変数から読み込み
+const LINE_CHANNEL_SECRET = process.env.CHANNEL_SECRET;
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.CHANNEL_ACCESS_TOKEN;
+const GAS_ENDPOINT = process.env.GAS_URL;
+
+app.use(bodyParser.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
   }
+}));
+
+// 質問一覧（QuickReplyが必要なものは指定）
+const questions = [
+  { text: '本名（氏名）を教えてください。' },
+  { text: '面接希望日を教えてください。（例：7月25日 15:00〜）' },
+  {
+    text: '経験はありますか？',
+    quickReplies: ['あり', 'なし']
+  },
+  { text: '過去に在籍していた店舗名があれば教えてください。' },
+  {
+    text: 'タトゥーや鯖（スジ彫り）はありますか？',
+    quickReplies: ['あり', 'なし']
+  },
+  { text: '顔写真または全身写真のURLを貼り付けてください。' },
+  { text: 'ご回答ありがとうございました！内容を確認して担当者よりご連絡いたします。' }
 ];
 
-const userStates = new Map();
+const userStates = {};
+
+function validateSignature(signature, body) {
+  const hash = crypto
+    .createHmac('SHA256', LINE_CHANNEL_SECRET)
+    .update(body)
+    .digest('base64');
+  return signature === hash;
+}
 
 app.post('/webhook', async (req, res) => {
-  Promise.all(req.body.events.map(handleEvent)).then(() => res.sendStatus(200));
+  const signature = req.headers['x-line-signature'];
+  const body = req.rawBody;
+
+  if (!validateSignature(signature, body)) {
+    console.log('[署名エラー] Invalid signature');
+    return res.status(401).send('Unauthorized');
+  }
+
+  const events = req.body.events;
+  for (const event of events) {
+    if (event.type === 'message' && event.message.type === 'text') {
+      const userId = event.source.userId;
+      const replyToken = event.replyToken;
+      const userMessage = event.message.text.trim();
+
+      // 初回メッセージ
+      if (!userStates[userId]) {
+        if (userMessage.includes('こんにちは') || userMessage.includes('スタート')) {
+          userStates[userId] = { step: 0, answers: [] };
+          await sendQuestion(replyToken, 0);
+        }
+        continue;
+      }
+
+      const state = userStates[userId];
+      state.answers.push(userMessage);
+      state.step++;
+
+      if (state.step < questions.length - 1) {
+        await sendQuestion(replyToken, state.step);
+      } else {
+        // 最終メッセージ送信
+        await replyMessage(replyToken, { type: 'text', text: questions[questions.length - 1].text });
+
+        // GASへ送信
+        try {
+          await axios.post(GAS_ENDPOINT, {
+            userId: userId,
+            answers: state.answers
+          });
+          console.log(`[送信成功] userId: ${userId}`);
+        } catch (error) {
+          console.error('[送信エラー] GASへのPOST失敗:', error.response?.data || error.message);
+        }
+
+        delete userStates[userId];
+      }
+    }
+  }
+
+  res.status(200).send('OK');
 });
 
-async function handleEvent(event) {
-  if (event.type !== 'message' || event.message.type !== 'text') return;
-
-  const userId = event.source.userId;
-  const replyToken = event.replyToken;
-  const userInput = event.message.text.trim();
-
-  if (!userStates.has(userId)) {
-    userStates.set(userId, { answers: {}, currentIndex: 0 });
-    return sendQuestion(replyToken, userId);
-  }
-
-  const state = userStates.get(userId);
-  const question = questions[state.currentIndex];
-  state.answers[question.key] = userInput;
-  state.currentIndex++;
-
-  if (state.currentIndex < questions.length) {
-    return sendQuestion(replyToken, userId);
-  } else {
-    await saveToSpreadsheet(userId, state.answers);
-    await client.replyMessage(replyToken, {
+async function sendQuestion(replyToken, step) {
+  const q = questions[step];
+  if (q.quickReplies) {
+    await replyMessage(replyToken, {
       type: 'text',
-      text: 'アンケートのご回答ありがとうございました！'
+      text: q.text,
+      quickReply: {
+        items: q.quickReplies.map(choice => ({
+          type: 'action',
+          action: {
+            type: 'message',
+            label: choice,
+            text: choice
+          }
+        }))
+      }
     });
-    userStates.delete(userId);
+  } else {
+    await replyMessage(replyToken, {
+      type: 'text',
+      text: q.text
+    });
   }
 }
 
-async function sendQuestion(replyToken, userId) {
-  const state = userStates.get(userId);
-  const q = questions[state.currentIndex];
-
-  const message = {
-    type: 'text',
-    text: q.text
-  };
-
-  if (q.quickReply) {
-    message.quickReply = {
-      items: q.quickReply.map(choice => ({
-        type: 'action',
-        action: {
-          type: 'message',
-          label: choice,
-          text: choice
-        }
-      }))
-    };
-  }
-
-  return client.replyMessage(replyToken, message);
-}
-
-async function saveToSpreadsheet(userId, answers) {
-  const data = {
-    userId,
-    timestamp: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }),
-    ...answers
-  };
-
+async function replyMessage(token, message) {
   try {
-    await axios.post(GAS_URL, data);
+    await axios.post('https://api.line.me/v2/bot/message/reply', {
+      replyToken: token,
+      messages: [message]
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`
+      }
+    });
   } catch (error) {
-    console.error('スプレッドシートへの保存失敗:', error.message);
+    console.error('[送信エラー] LINE返信失敗:', error.response?.data || error.message);
   }
 }
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Server running on ${port}`);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
 });
