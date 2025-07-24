@@ -1,5 +1,5 @@
 {
-  "name": "line-question-bot",
+  "name": "line-bot",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
@@ -7,8 +7,8 @@
   },
   "dependencies": {
     "@line/bot-sdk": "^7.5.0",
-    "axios": "^1.4.0",
-    "express": "^4.18.2",
-    "dotenv": "^16.1.4"
+    "axios": "^1.6.8",
+    "form-data": "^4.0.0",    ← ✅ この行が必要
+    "express": "^4.18.2"
   }
 }
