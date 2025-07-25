@@ -1,133 +1,155 @@
 const express = require('express');
-const line = require('@line/bot-sdk');
+const crypto = require('crypto');
 const axios = require('axios');
-const bodyParser = require('body-parser');
-const fs = require('fs');
+const line = require('@line/bot-sdk');
 const app = express();
-const port = process.env.PORT || 10000;
 
-app.use(bodyParser.json({ verify: (req, res, buf) => { req.rawBody = buf } }));
-
-// LINE設定
 const config = {
-  channelAccessToken: '【LINE_CHANNEL_ACCESS_TOKEN】',
-  channelSecret: '【LINE_CHANNEL_SECRET】'
+  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
+  channelSecret: process.env.LINE_CHANNEL_SECRET
 };
 
 const client = new line.Client(config);
+app.use(express.raw({ type: '*/*' })); // ⭐️ LINEの署名検証に必要
 
-// 状態管理
-const userStates = {};  // userId: { step: 0, answers: {} }
-
-// 質問一覧
+// 質問セット（順番に聞く）
 const questions = [
-  { key: 'name', text: '本名（氏名）を教えてください。' },
-  { key: 'interview', text: '面接希望日を教えてください。（例：7月25日 15:00〜）' },
-  { key: 'experience', text: '経験はありますか？', options: ['あり', 'なし'] },
-  { key: 'pastShop', text: '過去に在籍していた店舗名があれば教えてください。' },
-  { key: 'tattoo', text: 'タトゥーや鯖（スジ彫り）はありますか？', options: ['あり', 'なし'] },
-  { key: 'photo', text: '顔写真または全身写真を送ってください。' },
+  { key: 'name', text: '① 本名（氏名）を教えてください。' },
+  { key: 'date', text: '② 面接希望日を教えてください。（例：7月25日 15:00〜）' },
+  {
+    key: 'experience',
+    text: '③ 経験はありますか？',
+    quickReply: ['あり', 'なし']
+  },
+  { key: 'previousShop', text: '④ 過去に在籍していた店舗名があれば教えてください。' },
+  {
+    key: 'tattoo',
+    text: '⑤ タトゥーや鯖（スジ彫り）はありますか？',
+    quickReply: ['あり', 'なし']
+  },
+  { key: 'image', text: '⑥ 顔写真または全身写真を送ってください。（カメラマークで送信）' }
 ];
 
-app.post('/webhook', line.middleware(config), async (req, res) => {
-  Promise.all(req.body.events.map(handleEvent)).then(() => res.status(200).end());
+// 状態管理（userIdごとに質問ステータスを保持）
+const userStates = {};
+
+app.post('/webhook', async (req, res) => {
+  if (!validateSignature(req)) {
+    return res.status(401).send('Invalid signature');
+  }
+
+  const events = JSON.parse(req.body).events;
+
+  for (const event of events) {
+    if (event.type === 'message') {
+      const userId = event.source.userId;
+
+      if (!userStates[userId]) {
+        userStates[userId] = { step: 0, answers: { userId } };
+      }
+
+      const state = userStates[userId];
+      const current = questions[state.step];
+
+      // メッセージが画像の場合（image）
+      if (event.message.type === 'image' && current.key === 'image') {
+        try {
+          const buffer = await downloadImage(event.message.id);
+          const base64Image = buffer.toString('base64');
+
+          // GASに送信
+          await axios.post(process.env.GAS_ENDPOINT, {
+            base64Image,
+            name: state.answers.name || '未登録ユーザー'
+          });
+
+          state.answers.imageUrl = '画像アップロード済';
+          await client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: '⑦ ご回答ありがとうございました！内容を確認して担当者よりご連絡いたします。'
+          });
+
+          // 回答全体をGASへ送信
+          await axios.post(process.env.GAS_ENDPOINT, state.answers);
+
+          delete userStates[userId]; // 状態リセット
+        } catch (err) {
+          console.error('画像処理エラー:', err);
+          await client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: '画像の保存中にエラーが発生しました。再度お試しください。'
+          });
+        }
+      }
+
+      // テキストメッセージの場合
+      if (event.message.type === 'text' && current.key !== 'image') {
+        state.answers[current.key] = event.message.text;
+        state.step++;
+
+        if (state.step < questions.length) {
+          const next = questions[state.step];
+          await client.replyMessage(event.replyToken, formatQuestion(next));
+        } else {
+          await client.replyMessage(event.replyToken, {
+            type: 'text',
+            text: '画像を送ってください📷'
+          });
+        }
+      }
+    }
+  }
+
+  res.status(200).send('OK');
 });
 
-async function handleEvent(event) {
-  if (event.type !== 'message') return;
-
-  const userId = event.source.userId;
-  const user = userStates[userId] || { step: 0, answers: {} };
-  const currentQuestion = questions[user.step];
-
-  if (!currentQuestion) return;
-
-  if (currentQuestion.key === 'photo' && event.message.type === 'image') {
-    const buffer = await downloadImage(event.message.id);
-    const base64Image = buffer.toString('base64');
-    user.answers.photo = base64Image;
-    await postToGAS(user.answers, userId);
-    await client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: 'ご回答ありがとうございました！内容を確認して担当者よりご連絡いたします。'
-    });
-    delete userStates[userId];
-    return;
-  }
-
-  // 通常のテキスト・選択肢回答処理
-  const message = event.message;
-  if (message.type !== 'text') return;
-
-  // 初期化トリガー
-  if (!userStates[userId] || message.text === 'スタート') {
-    userStates[userId] = { step: 0, answers: {} };
-    await sendQuestion(userId, 0, event.replyToken);
-    return;
-  }
-
-  // 回答保存
-  user.answers[currentQuestion.key] = message.text;
-  user.step += 1;
-  userStates[userId] = user;
-
-  const nextQuestion = questions[user.step];
-  if (nextQuestion) {
-    await sendQuestion(userId, user.step, event.replyToken);
-  }
+// 署名検証関数
+function validateSignature(req) {
+  const signature = req.headers['x-line-signature'];
+  const body = req.body;
+  const hash = crypto
+    .createHmac('SHA256', config.channelSecret)
+    .update(body)
+    .digest('base64');
+  return hash === signature;
 }
 
-async function sendQuestion(userId, step, replyToken) {
-  const question = questions[step];
-  if (!question) return;
-
-  if (question.options) {
-    await client.replyMessage(replyToken, {
+// QuickReplyの整形
+function formatQuestion(q) {
+  if (q.quickReply) {
+    return {
       type: 'text',
-      text: question.text,
+      text: q.text,
       quickReply: {
-        items: question.options.map(option => ({
+        items: q.quickReply.map(label => ({
           type: 'action',
           action: {
             type: 'message',
-            label: option,
-            text: option
+            label,
+            text: label
           }
         }))
       }
-    });
+    };
   } else {
-    await client.replyMessage(replyToken, {
-      type: 'text',
-      text: question.text
-    });
+    return { type: 'text', text: q.text };
   }
 }
 
+// 画像をLINEのContent APIから取得
 async function downloadImage(messageId) {
-  const stream = await client.getMessageContent(messageId);
-  const chunks = [];
-  return new Promise((resolve, reject) => {
-    stream.on('data', chunk => chunks.push(chunk));
-    stream.on('end', () => resolve(Buffer.concat(chunks)));
-    stream.on('error', reject);
+  const url = `https://api-data.line.me/v2/bot/message/${messageId}/content`;
+  const response = await axios.get(url, {
+    headers: {
+      Authorization: `Bearer ${config.channelAccessToken}`
+    },
+    responseType: 'arraybuffer'
   });
+  return Buffer.from(response.data, 'binary');
 }
 
-async function postToGAS(answers, userId) {
-  const response = await axios.post('【GAS_ENDPOINT】', {
-    name: answers.name,
-    base64Image: answers.photo,
-    interview: answers.interview,
-    experience: answers.experience,
-    pastShop: answers.pastShop,
-    tattoo: answers.tattoo,
-    userId: userId,
-    timestamp: new Date().toISOString()
-  });
-  console.log('GAS Response:', response.data);
-}
-
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+// サーバー起動
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
