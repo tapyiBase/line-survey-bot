@@ -1,6 +1,7 @@
 {
   "name": "line-bot",
   "version": "1.0.0",
+  "type": "commonjs",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,7 +10,6 @@
     "@line/bot-sdk": "^7.5.0",
     "axios": "^1.6.8",
     "express": "^4.18.2",
-    "raw-body": "^2.5.2",
     "dotenv": "^16.4.5"
   }
 }
